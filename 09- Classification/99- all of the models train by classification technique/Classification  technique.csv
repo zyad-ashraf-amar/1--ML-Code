@@ -1,0 +1,8 @@
+Algorithm,Coding Complexity,Typical Use Cases,When to Use,Strengths,Weaknesses
+Logistic Regression,Simple,"Binary classification, interpretability","Baseline model, linear relationships","Interpretable coefficients, fast training","Limited to binary classes, assumes linearity"
+Decision Tree,Simple-Moderate,"Classification, regression, interpretability","Non-linear relationships, easy to interpret","Interpretable structure, handles various data types","Prone to overfitting, unstable predictions"
+Random Forest,Moderate,"Classification, regression, high variance","Robust model, reduces overfitting, missing value handling","High accuracy, feature importance","Less interpretable than single decision tree, can be computationally expensive"
+SVM,Moderate,Classification (high-dimensional),"Clear separation margins, robust to outliers","Effective in high dimensions, powerful for classification","Kernel selection can be complex, may overfit with small datasets"
+KNN,Simple,"Classification, regression (small datasets)","Simple, interpretable, non-linear data","Easy to understand, handles various data types","Sensitive to noisy data, high computation for large datasets"
+Naive Bayes,Very Simple,"Text classification, large datasets","Fast, probabilistic classifier, works well with text","Efficient for large datasets, handles missing values","Assumes feature independence, may be inaccurate for complex relationships"
+Gradient Boosting,Moderate-Complex,"Classification, regression (high accuracy)",High accuracy models,"Powerful ensemble method, reduces bias","Less interpretable, computationally expensive to train"

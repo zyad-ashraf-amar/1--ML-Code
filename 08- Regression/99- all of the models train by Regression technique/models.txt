@@ -1,0 +1,31 @@
+Linear Regression
+Polynomial Regression
+Ridge Regression
+Lasso Regression
+Elastic Net Regression
+Bayesian Regression
+Support Vector Regression (SVR)
+Decision Tree Regression
+Random Forest Regression
+Gradient Boosting Regression
+Gradient Boosting Regressor
+XGBoost Regressor
+LightGBM Regressor
+CatBoost Regressor
+K-Nearest Neighbors Regression (KNN)
+Neural Networks for Regression
+Multi-layer Perceptron (MLP) Regressor
+Convolutional Neural Networks (CNN) for Regression
+Recurrent Neural Networks (RNN) for Regression
+AdaBoost Regression
+Bagging Regressor
+Extra Trees Regressor
+Stochastic Gradient Descent (SGD) Regressor
+Principal Component Regression (PCR)
+Partial Least Squares Regression (PLSR)
+Quantile Regression
+Tweedie Regression
+Generalized Linear Models (GLM)
+Poisson Regression
+Gamma Regression
+Binomial Regression

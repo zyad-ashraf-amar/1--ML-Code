@@ -1,0 +1,40 @@
+write Schedule for Regression techniques in that Schedule:
+1- Technique
+2- Coding Complexity
+3- Typical Use Cases
+4- When to Use
+5- good with overfitting
+6- Strengths
+7- Weaknesses
+8- another information can help me 
+
+For these techniques:
+1- Linear_regression
+2- Ridge_Regression
+3- Lasso_Regression
+4- Elastic_Net_Regression
+5- Polynomial_Regression
+6- KNeighbors_Regressor_(KNN_Regressor)
+7- Support_vector_machine_(SVR)
+8- Decision_Tree_Regression
+9- Bagging_Regression
+10- Random_Forest_Regression
+11- Extra_Trees_Regression
+12- AdaBoost_Regression
+13- Gradient_Boosting_Regression
+14- CatBoost_Regression
+15- XGBoost_Regression
+16- StackingRegressor
+17- Bayesian Regression
+18- Multi-layer Perceptron (MLP) Regressor
+19- Convolutional Neural Networks (CNN) for Regression
+20- Recurrent Neural Networks (RNN) for Regression
+21- Stochastic Gradient Descent (SGD) Regressor
+22- Principal Component Regression (PCR)
+23- Partial Least Squares Regression (PLSR)
+24- Quantile Regression
+25- Tweedie Regression
+26- Generalized Linear Models (GLM)
+27- Poisson Regression
+28- Gamma Regression
+29- Binomial Regression

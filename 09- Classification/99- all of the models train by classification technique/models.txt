@@ -1,0 +1,34 @@
+Logistic Regression
+Gaussian Naive Bayes
+Multinomial Naive Bayes
+Bernoulli Naive Bayes
+K-Nearest Neighbors (KNN)
+Support Vector Machines (SVM)
+Decision Trees
+Random Forest
+Gradient Boosting Machines
+Gradient Boosting Classifier
+XGBoost
+LightGBM
+CatBoost
+Neural Networks
+Multi-layer Perceptron (MLP)
+Convolutional Neural Networks (CNN)
+Recurrent Neural Networks (RNN)
+AdaBoost
+Bagging Classifier
+Extra Trees Classifier
+Linear Discriminant Analysis (LDA)
+Quadratic Discriminant Analysis (QDA)
+Stochastic Gradient Descent (SGD) Classifier
+Extreme Learning Machines (ELM)
+Regularized Discriminant Analysis (RDA)
+
+
+
+
+I want to write KNeighborsClassifier definitions, advantages, disadvantages, and use cases of this modal. Does the KNeighborsClassifier need scaling and encoder the data to numerical or not? then in code get the best params used in GridSearchCV and the best params used in RandomizedSearchCV.
+
+is that the best param_grid and param_dist to cover all Training cases?
+
+I want to write AdaBoost Classifier definitions, advantages, disadvantages, and use cases of this modal. Does the AdaBoost Classifier need scaling and encoder the data to numerical or not? then in code get the best params used in GridSearchCV and the best params used in RandomizedSearchCV and write three codes first code AdaBoost with the default estimator second code AdaBoost with a single choosing estimator like SVC and third code AdaBoost with multi estimator like SVC, Decision_Tree and GaussianNB
