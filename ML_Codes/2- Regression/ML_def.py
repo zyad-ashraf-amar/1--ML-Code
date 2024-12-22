@@ -10,6 +10,7 @@ import seaborn as sns
 import matplotlib.pyplot as plt
 from matplotlib.patches import Patch
 from matplotlib.colors import LinearSegmentedColormap
+import pickle
 import copy
 import logging
 import missingno
@@ -26,6 +27,7 @@ from imblearn.over_sampling import (
     SMOTEN,
     SMOTENC
 )
+from sklearn.impute import KNNImputer, SimpleImputer
 from imblearn.under_sampling import (
     TomekLinks, 
     RandomUnderSampler,
@@ -177,8 +179,6 @@ from typing import (
 )
 
 
-
-
 logging.basicConfig(level=logging.INFO)
 logging.getLogger('matplotlib').setLevel(logging.WARNING)
 
@@ -236,6 +236,7 @@ def read_data(file_path: str, sheet_name: str = None, handle_duplicates: bool = 
     except Exception as e:
         print(f'Error reading data from {file_path}: {str(e)}')
         raise
+
 
 def columns_info(df):
     cols=[]
@@ -324,80 +325,220 @@ def convert_to_numeric(df, column_name):
         df[col] = pd.to_numeric(df[col], errors='coerce')
 
 
+def label_encode(df: pd.DataFrame, column: str) -> pd.DataFrame:
+    """
+    Perform label encoding on a specific column, preserving NaN values.
+    
+    Parameters:
+    df (pd.DataFrame): Input DataFrame
+    column (str): Column to encode
+    
+    Returns:
+    pd.DataFrame: DataFrame with encoded column
+    """
+    le = LabelEncoder()
+    non_nan_mask = df[column].notna()
+    le.fit(df.loc[non_nan_mask, column])
+    df.loc[non_nan_mask, column] = le.transform(df.loc[non_nan_mask, column])
+    return df, le
 
-def fill_missing_values_dataFrame(df: pd.DataFrame, 
-                         model: Literal['KNNImputer', 'SimpleImputer', 'IterativeImputer', 'constant', 'mean', 'median', 'mode', 'interpolation','Forward_fill','Backward_fill'] = 'KNNImputer', 
-                         n_neighbors: int = 5, 
-                         weights: str = 'uniform', 
-                         strategy: str = 'mean', 
-                         fill_value = None,
-                         estimator = None,
-                         max_iter = 10,
-                         tol = 0.001,
-                         constant: Union[int, float] = 0
-                         ) -> pd.DataFrame:
+
+def binary_dependent_impute(df: pd.DataFrame, column_to_impute: str, dependent_column: str, top_n: int = 3) -> pd.DataFrame:
+    """
+    Impute null values in a column based on the values in a dependent binary-like column.
+    
+    Parameters:
+    df (pd.DataFrame): Input DataFrame
+    column_to_impute (str): Column with null values to be imputed
+    dependent_column (str): Binary-like column to determine imputation strategy
+    top_n (int): Number of top values to consider for random imputation
+    
+    Returns:
+    pd.DataFrame: DataFrame with imputed values
+    """
+    # Create a copy of the DataFrame
+    imputed_df = df.copy()
+    
+    # Calculate the proportion of 0s and 1s in the column
+    value_counts = imputed_df[column_to_impute].value_counts(normalize=True)
+    # print(f"Value proportions in {column_to_impute}:")
+    # print(value_counts)
+    
+    # Find null values
+    null_mask = imputed_df[column_to_impute].isnull()
+    
+    # Identify corresponding dependent column values for null rows
+    dep_null_rows = imputed_df.loc[null_mask, dependent_column]
+    
+    # Imputation logic
+    for dep_value in [0, 1]:
+        # Find rows where dependent column matches current value
+        dep_matching_mask = (dep_null_rows == dep_value)
+        
+        if dep_matching_mask.sum() > 0:
+            # Get non-null values for the current dependent value
+            non_null_values = imputed_df.loc[
+                (imputed_df[dependent_column] == dep_value) & 
+                (imputed_df[column_to_impute].notnull()), 
+                column_to_impute
+            ]
+            
+            if len(non_null_values) > 0:
+                # Find top N most frequent values
+                top_values = non_null_values.value_counts().nlargest(top_n).index.tolist()
+                
+                # Get indices of null rows to impute for this dependent value
+                impute_indices = imputed_df.index[null_mask & (dep_null_rows == dep_value)]
+                
+                # Randomly impute from top values
+                imputed_values = [random.choice(top_values) for _ in range(len(impute_indices))]
+                
+                # Fill the null values
+                imputed_df.loc[impute_indices, column_to_impute] = imputed_values
+    
+    return imputed_df
+
+
+def fill_missing_values_dataFrame(
+    df: pd.DataFrame, 
+    model: Literal['KNNImputer', 'SimpleImputer', 'dependent_column', 'IterativeImputer', 'constant', 'mean', 'median', 'mode', 'interpolation', 'Forward_fill', 'Backward_fill'] = 'KNNImputer', 
+    n_neighbors: int = 5, 
+    weights: str = 'uniform', 
+    strategy: str = 'mean', 
+    fill_value = None,
+    estimator = None,
+    max_iter: int = 10,
+    tol: float = 0.001,
+    constant: Union[int, float] = 0,
+    column_to_impute: str = None,
+    dependent_column: str = None,
+    top_n: int = 3
+) -> pd.DataFrame:
     """
     Impute missing values in the DataFrame using the specified imputation strategy.
     
     Parameters:
     df (pd.DataFrame): DataFrame with missing values.
-    model (str): Imputation strategy to use ('KNNImputer', 'SimpleImputer', 'constant', 
-                'mean', 'median', 'mode', 'interpolation', 'IterativeImputer'). Default is 'KNNImputer'.
-    n_neighbors (int): Number of neighbors to use for KNNImputer. Default is 5.
-    weights (str): Weight function for KNNImputer. Default is 'uniform'.
-    strategy (str): Strategy function for SimpleImputer. Default is 'mean'.
-    constant (int/float): Value to fill missing values with when using 'constant'. Default is 0.
+    model (str): Imputation strategy to use. Default is 'KNNImputer'.
+    column_to_impute (str): Column to impute for 'dependent_column' model.
+    dependent_column (str): Dependent column for 'dependent_column' model.
+    top_n (int): Number of top values to consider for 'dependent_column'.
     
     Returns:
     pd.DataFrame: DataFrame with imputed values.
-    
-    Raises:
-    ValueError: If an invalid model is specified.
     """
+    # Create a copy of the DataFrame to avoid modifying the original
+    df_imputed = df.copy()
+    
     # Identify columns with missing values
-    missing_columns = df.columns[df.isnull().any()].tolist()
+    missing_columns = df_imputed.columns[df_imputed.isnull().any()].tolist()
     print(f"Columns with missing values: {missing_columns}")
     
-    valid_models = ['KNNImputer', 'SimpleImputer', 'IterativeImputer', 'constant', 'mean', 'median', 'mode', 'interpolation','Forward_fill','Backward_fill']
+    # Validate model
+    valid_models = [
+        'KNNImputer', 'SimpleImputer', 'dependent_column', 
+        'constant', 'mean', 'median', 'mode', 
+        'interpolation', 'Forward_fill', 'Backward_fill'
+    ]
     if model not in valid_models:
         raise ValueError(f"Invalid model specified. Choose from {valid_models}")
     
-    feature_columns = df.columns
-    print(f'Starting imputation using {model} model')
+    # Perform imputation based on the selected model
+    if model == 'dependent_column':
+        # Validate required parameters
+        if not column_to_impute or not dependent_column:
+            raise ValueError("For 'dependent_column', both column_to_impute and dependent_column must be specified")
+        
+        df_imputed = binary_dependent_impute(
+            df_imputed, 
+            column_to_impute, 
+            dependent_column, 
+            top_n
+        )
     
-    if model == 'KNNImputer':
-        from sklearn.impute import KNNImputer
+    elif model == 'KNNImputer':
+        # Separate numeric and categorical columns
+        numeric_columns = df_imputed.select_dtypes(include=['int64', 'float64']).columns
+        categorical_columns = df_imputed.select_dtypes(include=['object']).columns
+        
+        # Handle categorical columns
+        label_encoders = {}
+        encoded_df = df_imputed.copy()
+        
+        for col in categorical_columns:
+            # Use the custom label_encode function
+            encoded_df, le = label_encode(encoded_df, col)
+            label_encoders[col] = le
+        
+        # Prepare numeric and encoded data for KNN imputation
         imputer = KNNImputer(n_neighbors=n_neighbors, weights=weights)
-        df = imputer.fit_transform(df)
+        imputed_data = imputer.fit_transform(encoded_df)
+        
+        # Convert back to DataFrame
+        imputed_df = pd.DataFrame(imputed_data, columns=encoded_df.columns, index=df_imputed.index)
+        
+        # Decode categorical columns
+        for col, le in label_encoders.items():
+            # Round the imputed values for categorical columns and convert to integer
+            imputed_categorical = imputed_df[col].round().astype(int)
+            
+            # Reconstruct the original column preserving NaN
+            original_mask = df_imputed[col].notna()
+            categorical_result = df_imputed[col].copy()
+            categorical_result[original_mask] = le.inverse_transform(imputed_categorical[original_mask])
+            
+            df_imputed[col] = categorical_result
+        
+        # Copy numeric columns directly
+        df_imputed[numeric_columns] = imputed_df[numeric_columns]
+    
     elif model == 'SimpleImputer':
-        from sklearn.impute import SimpleImputer
-        imputer = SimpleImputer(strategy=strategy,fill_value=fill_value)
-        df = imputer.fit_transform(df)
-    elif model == 'IterativeImputer':
-        from sklearn.experimental import enable_iterative_imputer
-        from sklearn.impute import IterativeImputer
-        imputer = IterativeImputer(estimator=estimator, max_iter=max_iter, random_state=42, tol=tol)
-        df = imputer.fit_transform(df)
+        # Separate numeric and categorical columns
+        numeric_columns = df_imputed.select_dtypes(include=['int64', 'float64']).columns
+        categorical_columns = df_imputed.select_dtypes(include=['object']).columns
+        
+        # For SimpleImputer, handle numeric and categorical columns separately
+        numeric_imputer = SimpleImputer(strategy=strategy, fill_value=fill_value)
+        df_imputed[numeric_columns] = numeric_imputer.fit_transform(df_imputed[numeric_columns])
+        
+        categorical_imputer = SimpleImputer(strategy='most_frequent')
+        df_imputed[categorical_columns] = categorical_imputer.fit_transform(df_imputed[categorical_columns])
+    
     elif model == 'constant':
-        df = df.fillna(constant)
+        df_imputed = df_imputed.fillna(constant)
+    
     elif model == 'mean':
-        df = df.fillna(df.mean())
+        numeric_columns = df_imputed.select_dtypes(include=['int64', 'float64']).columns
+        categorical_columns = df_imputed.select_dtypes(include=['object']).columns
+        
+        df_imputed[numeric_columns] = df_imputed[numeric_columns].fillna(df_imputed[numeric_columns].mean())
+        df_imputed[categorical_columns] = df_imputed[categorical_columns].fillna(df_imputed[categorical_columns].mode().iloc[0])
+    
     elif model == 'median':
-        df = df.fillna(df.median())
+        numeric_columns = df_imputed.select_dtypes(include=['int64', 'float64']).columns
+        categorical_columns = df_imputed.select_dtypes(include=['object']).columns
+        
+        df_imputed[numeric_columns] = df_imputed[numeric_columns].fillna(df_imputed[numeric_columns].median())
+        df_imputed[categorical_columns] = df_imputed[categorical_columns].fillna(df_imputed[categorical_columns].mode().iloc[0])
+    
     elif model == 'mode':
-        df = df.apply(lambda x: x.fillna(x.mode()[0]), axis=0)
+        df_imputed = df_imputed.apply(lambda x: x.fillna(x.mode()[0]), axis=0)
+    
     elif model == 'interpolation':
-        df = df.interpolate()
+        numeric_columns = df_imputed.select_dtypes(include=['int64', 'float64']).columns
+        categorical_columns = df_imputed.select_dtypes(include=['object']).columns
+        
+        df_imputed[numeric_columns] = df_imputed[numeric_columns].interpolate()
+        df_imputed[categorical_columns] = df_imputed[categorical_columns].fillna(method='ffill').fillna(method='bfill')
+    
     elif model == 'Forward_fill':
-        df = df.ffill()
+        df_imputed = df_imputed.fillna(method='ffill')
+    
     elif model == 'Backward_fill':
-        df = df.bfill()
-    
-    
-    df = pd.DataFrame(df, columns=feature_columns)
+        df_imputed = df_imputed.fillna(method='bfill')
     
     print(f'Imputation completed using {model} model')
-    return df
+    return df_imputed
 
 
 def fill_missing_values_column(df: pd.DataFrame, 
@@ -753,6 +894,19 @@ def plot_outliers_scatterplot_zscore(df, outlier_counts, subplot_row=3, figsize:
     plt.show()
 
 
+def save_transformation_metadata(metadata, column, method):
+    """Save transformation metadata to pickle."""
+    if not os.path.exists('pickle'):
+        os.makedirs('pickle')
+    
+    filename = f"{column.replace(' ', '_')}_{method}_metadata.pkl"
+    filepath = os.path.join('pickle', filename)
+    
+    with open(filepath, 'wb') as file:
+        pickle.dump(metadata, file)
+    print(f"Metadata for '{column}' ({method}) saved as '{filename}'.")
+
+
 def handle_outliers_IQR(df, 
                     columns, 
                     method: Literal['cap', 'remove', 'impute', 'transform', 'flag']='cap', 
@@ -774,6 +928,7 @@ def handle_outliers_IQR(df,
     pd.DataFrame: DataFrame with handled outliers
     """
     df_copy = df.copy()
+    metadata = {}
     
     for col in columns:
         q1 = df_copy[col].quantile(0.25)
@@ -781,6 +936,9 @@ def handle_outliers_IQR(df,
         iqr = q3 - q1
         lower_bound = q1 - threshold * iqr
         upper_bound = q3 + threshold * iqr
+        
+        metadata[col] = {'method': method, 'threshold': threshold, 
+                        'lower_bound': lower_bound, 'upper_bound': upper_bound}
         
         # This method caps the outliers at a specified percentile. It preserves the data points but limits their extreme values.
         if method == 'cap':
@@ -792,15 +950,10 @@ def handle_outliers_IQR(df,
         
         # This involves replacing outliers with a central tendency measure (mean, median) or a boundary value.
         elif method == 'impute':
-            if imputation_method == 'median':
-                replacement = df_copy[col].median()
-            elif imputation_method == 'mean':
-                replacement = df_copy[col].mean()
-            else:
-                raise ValueError("Invalid imputation method. Choose 'median' or 'mean'.")
-            
+            replacement = df_copy[col].median() if imputation_method == 'median' else df_copy[col].mean()
             df_copy.loc[df_copy[col] < lower_bound, col] = replacement
             df_copy.loc[df_copy[col] > upper_bound, col] = replacement
+            metadata[col]['imputation_value'] = replacement
         
         # This involves applying a mathematical function to reduce the impact of outliers. Common transformations include log, square root, or Box-Cox.
         elif method == 'transform':
@@ -812,6 +965,7 @@ def handle_outliers_IQR(df,
                 df_copy[col], _ = stats.boxcox(df_copy[col] + 1)  # Adding 1 to handle zero values
             else:
                 raise ValueError("Invalid transformation method. Choose 'log', 'sqrt', or 'boxcox'.")
+            metadata[col]['transformation_method'] = transformation_method
         
         # This involves creating a new binary column to flag outliers and keeping the original values. This allows the model to treat outliers differently.
         elif method == 'flag':
@@ -819,57 +973,63 @@ def handle_outliers_IQR(df,
         
         else:
             raise ValueError("Invalid method. Choose 'cap', 'remove', 'impute', 'transform', or 'flag'.")
+        
+        save_transformation_metadata(metadata[col], col, method)
     
     return df_copy
 
 
 def handle_outliers_zscore(df, 
-                    columns, 
-                    method: Literal['cap', 'remove', 'impute', 'transform', 'flag']='cap', 
-                    z_threshold=3, 
-                    imputation_method: Literal['median', 'mean']='mean', 
-                    transformation_method: Literal['log', 'sqrt', 'boxcox']='log'):
+                           columns, 
+                           method='cap', 
+                           z_threshold=3, 
+                           imputation_method='mean', 
+                           transformation_method='log'):
     """
-    Handle outliers in specified columns of a DataFrame using Z-score method.
-    
+    Handle outliers in specified columns of a DataFrame using Z-score method and save transformation metadata.
+
     Parameters:
-    df (pd.DataFrame): Input DataFrame
-    columns (list): List of column names to process
-    method (str): Outlier handling method ('cap', 'trim', 'cap', 'impute', 'transform', 'flag')
-    z_threshold (float): Z-score threshold for defining outliers
-    imputation_method (str): Method for imputation ('median' or 'mean')
-    transformation_method (str): Method for transformation ('log', 'sqrt', or 'boxcox')
-    
+    df (pd.DataFrame): Input DataFrame.
+    columns (list): List of column names to process.
+    method (str): Outlier handling method ('cap', 'remove', 'impute', 'transform', 'flag').
+    z_threshold (float): Z-score threshold for defining outliers.
+    imputation_method (str): Method for imputation ('median' or 'mean').
+    transformation_method (str): Method for transformation ('log', 'sqrt', or 'boxcox').
+
     Returns:
-    pd.DataFrame: DataFrame with handled outliers
+    pd.DataFrame: DataFrame with handled outliers.
     """
     df_copy = df.copy()
-    
+    metadata = {}
+
     for col in columns:
-        z_scores = zscore(df_copy[col])
+        z_scores = zscore(df_copy[col].dropna())
+        outliers = (np.abs(z_scores) > z_threshold)
         
-        # This method caps the outliers at a specified percentile. It preserves the data points but limits their extreme values.
+        # Save metadata for the column
+        metadata[col] = {'method': method, 'z_threshold': z_threshold}
+        
+        # Cap the outliers at the threshold
         if method == 'cap':
-            upper_bound = df_copy[col].mean() * 0.98 + z_threshold * df_copy[col].std()
-            lower_bound = df_copy[col].mean() * 1.02 - z_threshold * df_copy[col].std()
+            mean = df_copy[col].mean()
+            std_dev = df_copy[col].std()
+            lower_bound = mean - z_threshold * std_dev
+            upper_bound = mean + z_threshold * std_dev
             df_copy[col] = np.clip(df_copy[col], lower_bound, upper_bound)
+            metadata[col]['lower_bound'] = lower_bound
+            metadata[col]['upper_bound'] = upper_bound
         
-        # This method removing the outliers from the dataset
+        # Remove the outliers from the DataFrame
         elif method == 'remove':
-            df_copy = df_copy[(z_scores.abs() <= z_threshold)]
+            df_copy = df_copy[~outliers]
         
-        # This involves replacing outliers with a central tendency measure (mean, median) or a boundary value.
+        # Impute the outliers with the mean or median
         elif method == 'impute':
-            if imputation_method == 'median':
-                replacement = df_copy[col].median()
-            elif imputation_method == 'mean':
-                replacement = df_copy[col].mean()
-            else:
-                raise ValueError("Invalid imputation method. Choose 'median' or 'mean'.")
-            
-            df_copy.loc[z_scores.abs() > z_threshold, col] = replacement
+            replacement = df_copy[col].median() if imputation_method == 'median' else df_copy[col].mean()
+            df_copy.loc[outliers, col] = replacement
+            metadata[col]['imputation_value'] = replacement
         
-        # This involves applying a mathematical function to reduce the impact of outliers. Common transformations include log, square root, or Box-Cox.
+        # Apply a transformation to handle outliers
         elif method == 'transform':
             if transformation_method == 'log':
                 df_copy[col] = np.log1p(df_copy[col])
@@ -879,13 +1039,17 @@ def handle_outliers_zscore(df,
                 df_copy[col], _ = stats.boxcox(df_copy[col] + 1)
             else:
                 raise ValueError("Invalid transformation method. Choose 'log', 'sqrt', or 'boxcox'.")
+            metadata[col]['transformation_method'] = transformation_method
         
-        # This involves creating a new binary column to flag outliers and keeping the original values. This allows the model to treat outliers differently.
+        # Add a flag column to identify outliers
         elif method == 'flag':
-            df_copy[f'{col}_is_outlier'] = (z_scores.abs() > z_threshold).astype(int)
+            df_copy[f'{col}_is_outlier'] = outliers.astype(int)
         
         else:
             raise ValueError("Invalid method. Choose 'cap', 'remove', 'impute', 'transform', or 'flag'.")
+        
+        # Save metadata to a pickle file
+        save_transformation_metadata(metadata[col], col, method)
     
     return df_copy
 
@@ -974,7 +1138,7 @@ def handle_skewness(
     Returns:
     - DataFrame with original and transformed columns
     """
-    
+    metadata = {}
     available_methods = ['log', 'sqrt', 'cbrt', 'reciprocal', 'boxcox', 'yeo_johnson', 'winsorize', 'binning', 'robust_scale']
     
     if method not in available_methods:
@@ -982,11 +1146,14 @@ def handle_skewness(
 
     for col in columns:
         
+        metadata[col] = {'method': method}
+        
         if method == 'log':
             # Handles right-skewed data well, can't handle negative values
             if np.any(df[col] <= 0):
                 raise ValueError(f"Column {col} contains non-positive values, cannot apply log transformation")
             df[col] = np.log(df[col]) / np.log(log_base)
+            metadata[col]['log_base'] = log_base
         
         elif method == 'sqrt':
             # Handles right-skewed data, less aggressive than log
@@ -1009,10 +1176,12 @@ def handle_skewness(
             if np.any(df[col] <= 0):
                 raise ValueError(f"Column {col} contains non-positive values, cannot apply boxcox transformation")
             df[col], _ = stats.boxcox(df[col], lmbda=boxcox_lambda)
+            metadata[col]['boxcox_lambda'] = boxcox_lambda
         
         elif method == 'yeo_johnson':
             # Handles both right and left-skewed data, can handle negative values
             df[col], _ = stats.yeojohnson(df[col], lmbda=yeo_johnson_lambda)
+            metadata[col]['yeo_johnson_lambda'] = yeo_johnson_lambda
         
         elif method == 'winsorize':
             # Handles both right and left-skewed data by capping extreme values
@@ -1033,12 +1202,10 @@ def handle_skewness(
             # Handles both right and left-skewed data
             scaler = RobustScaler(quantile_range=robust_scale_quantile_range)
             df[col] = scaler.fit_transform(df[col].values.reshape(-1, 1))
-    
+            
+        save_transformation_metadata(metadata[col], col, method)
+        
     return df
-
-
-
-
 
 
 def check_balance_classification(df: pd.DataFrame, column_plot: Optional[str] = None, palette='magma', edgecolor='black', order: bool = True) -> pd.DataFrame:
@@ -1225,7 +1392,6 @@ def rate_by_group(
     return pd.DataFrame(list(group_of_range.items()), columns=['name', 'values'])
 
 
-
 def over_under_sampling_classification(
     x: pd.DataFrame, 
     y: pd.Series, 
@@ -1350,7 +1516,6 @@ def over_under_sampling_classification(
         return x, y
 
 
-
 def custom_smote_regression(x: pd.DataFrame, y: pd.Series, sampling_strategy: float, k_neighbors: int, random_state: int) -> Tuple[pd.DataFrame, pd.Series]:
     np.random.seed(random_state)
     n_samples = int(sampling_strategy * len(y))
@@ -1378,6 +1543,7 @@ def custom_smote_regression(x: pd.DataFrame, y: pd.Series, sampling_strategy: fl
     synthetic_y = pd.Series(synthetic_y, name=y.name)
     
     return pd.concat([x, synthetic_x]), pd.concat([y, synthetic_y])
+
 
 def over_under_sampling_regression(x: pd.DataFrame, 
                                    y: pd.Series, 
@@ -1434,113 +1600,111 @@ def over_under_sampling_regression(x: pd.DataFrame,
     return df, x, y
 
 
-# def over_under_sampling_regression(
-#     x: pd.DataFrame, 
-#     y: pd.Series, 
-#     over_sampling: Optional[str] = None, 
-#     under_sampling: Optional[str] = None, 
-#     over_sampling_strategy: Union[float, dict] = 0.5, 
-#     under_sampling_strategy: Union[float, dict] = 0.5, 
-#     k_neighbors: int = 5, 
-#     random_state: int = 42, 
-#     over: bool = True, 
-#     under: bool = True
-# ) -> Tuple[pd.DataFrame, pd.DataFrame, pd.Series]:
-#     """
-#     Perform over-sampling and/or under-sampling on the given dataset for regression.
+def over_under_sampling_regression(
+    x: pd.DataFrame, 
+    y: pd.Series, 
+    over_sampling: Optional[str] = None, 
+    under_sampling: Optional[str] = None, 
+    over_sampling_strategy: Union[float, dict] = 0.5, 
+    under_sampling_strategy: Union[float, dict] = 0.5, 
+    k_neighbors: int = 5, 
+    random_state: int = 42, 
+    over: bool = True, 
+    under: bool = True
+) -> Tuple[pd.DataFrame, pd.DataFrame, pd.Series]:
+    """
+    Perform over-sampling and/or under-sampling on the given dataset for regression.
 
-#     Parameters:
-#     x (pd.DataFrame): The input features.
-#     y (pd.Series): The target variable.
-#     over_sampling (str, optional): The over-sampling strategy to use ('random_over_sampler', 'smote', 'adasyn', or None for SMOTE). Default is None.
-#     under_sampling (str, optional): The under-sampling strategy to use ('random_under_sampler', 'tomek_links', 'enn', 'renn', 'allknn', 
-#                                     'cnn', 'cc', 'nm'). Default is None.
-#     over_sampling_strategy (float or dict): The strategy to use for over-sampling. Default is 0.5.
-#     under_sampling_strategy (float or dict): The strategy to use for under-sampling. Default is 0.5.
-#     k_neighbors (int): Number of nearest neighbors for SMOTE. Default is 5.
-#     random_state (int): Random state for reproducibility. Default is 42.
-#     over (bool): Whether to apply over-sampling. Default is True.
-#     under (bool): Whether to apply under-sampling. Default is True.
+    Parameters:
+    x (pd.DataFrame): The input features.
+    y (pd.Series): The target variable.
+    over_sampling (str, optional): The over-sampling strategy to use ('random_over_sampler', 'smote', 'adasyn', or None for SMOTE). Default is None.
+    under_sampling (str, optional): The under-sampling strategy to use ('random_under_sampler', 'tomek_links', 'enn', 'renn', 'allknn', 
+                                    'cnn', 'cc', 'nm'). Default is None.
+    over_sampling_strategy (float or dict): The strategy to use for over-sampling. Default is 0.5.
+    under_sampling_strategy (float or dict): The strategy to use for under-sampling. Default is 0.5.
+    k_neighbors (int): Number of nearest neighbors for SMOTE. Default is 5.
+    random_state (int): Random state for reproducibility. Default is 42.
+    over (bool): Whether to apply over-sampling. Default is True.
+    under (bool): Whether to apply under-sampling. Default is True.
 
-#     Returns:
-#     Tuple[pd.DataFrame, pd.DataFrame, pd.Series]: The DataFrame with combined features and target, resampled features, and resampled target.
-#     """
-#     print(f'Starting over-sampling and/or under-sampling process.')
+    Returns:
+    Tuple[pd.DataFrame, pd.DataFrame, pd.Series]: The DataFrame with combined features and target, resampled features, and resampled target.
+    """
+    print(f'Starting over-sampling and/or under-sampling process.')
     
-#     valid_over_sampling_strategies = [
-#         'random_over_sampler', 'smote', 'adasyn'
-#     ]
-#     valid_under_sampling_strategies = [
-#         'random_under_sampler', 'tomek_links', 'enn', 'renn', 'allknn', 
-#         'cnn', 'cc', 'nm'
-#     ]
+    valid_over_sampling_strategies = [
+        'random_over_sampler', 'smote', 'adasyn'
+    ]
+    valid_under_sampling_strategies = [
+        'random_under_sampler', 'tomek_links', 'enn', 'renn', 'allknn', 
+        'cnn', 'cc', 'nm'
+    ]
     
-#     if over and over_sampling not in valid_over_sampling_strategies:
-#         raise ValueError(f"Invalid over_sampling strategy '{over_sampling}' specified. "
-#                          f"Valid options are: {', '.join(valid_over_sampling_strategies)}")
+    if over and over_sampling not in valid_over_sampling_strategies:
+        raise ValueError(f"Invalid over_sampling strategy '{over_sampling}' specified. "
+                         f"Valid options are: {', '.join(valid_over_sampling_strategies)}")
     
-#     if under and under_sampling not in valid_under_sampling_strategies:
-#         raise ValueError(f"Invalid under_sampling strategy '{under_sampling}' specified. "
-#                          f"Valid options are: {', '.join(valid_under_sampling_strategies)}")
+    if under and under_sampling not in valid_under_sampling_strategies:
+        raise ValueError(f"Invalid under_sampling strategy '{under_sampling}' specified. "
+                         f"Valid options are: {', '.join(valid_under_sampling_strategies)}")
     
-#     # Over-sampling
-#     if over:
-#         if over_sampling == 'smote':
-#             print(f'Applying SMOTE with strategy {over_sampling_strategy}')
-#             smote = SMOTE(sampling_strategy=over_sampling_strategy, random_state=random_state, k_neighbors=k_neighbors)
-#             x, y = smote.fit_resample(x, y)
-#         elif over_sampling == 'adasyn':
-#             print(f'Applying ADASYN with strategy {over_sampling_strategy}')
-#             adasyn = ADASYN(sampling_strategy=over_sampling_strategy, random_state=random_state)
-#             x, y = adasyn.fit_resample(x, y)
-#         elif over_sampling == 'random_over_sampler':
-#             print(f'Applying RandomOverSampler with strategy {over_sampling_strategy}')
-#             ros = RandomOverSampler(sampling_strategy=over_sampling_strategy, random_state=random_state)
-#             x, y = ros.fit_resample(x, y)
+    # Over-sampling
+    if over:
+        if over_sampling == 'smote':
+            print(f'Applying SMOTE with strategy {over_sampling_strategy}')
+            smote = SMOTE(sampling_strategy=over_sampling_strategy, random_state=random_state, k_neighbors=k_neighbors)
+            x, y = smote.fit_resample(x, y)
+        elif over_sampling == 'adasyn':
+            print(f'Applying ADASYN with strategy {over_sampling_strategy}')
+            adasyn = ADASYN(sampling_strategy=over_sampling_strategy, random_state=random_state)
+            x, y = adasyn.fit_resample(x, y)
+        elif over_sampling == 'random_over_sampler':
+            print(f'Applying RandomOverSampler with strategy {over_sampling_strategy}')
+            ros = RandomOverSampler(sampling_strategy=over_sampling_strategy, random_state=random_state)
+            x, y = ros.fit_resample(x, y)
     
-#     # Under-sampling
-#     if under:
-#         if under_sampling == 'tomek_links':
-#             print(f'Applying TomekLinks under-sampling.')
-#             tom = TomekLinks(n_jobs=-1)
-#             x, y = tom.fit_resample(x, y)
-#         elif under_sampling == 'enn':
-#             print(f'Applying EditedNearestNeighbours with strategy {under_sampling_strategy}')
-#             enn = EditedNearestNeighbours(sampling_strategy=under_sampling_strategy, n_neighbors=3, kind_sel='all', n_jobs=-1)
-#             x, y = enn.fit_resample(x, y)
-#         elif under_sampling == 'renn':
-#             print(f'Applying RepeatedEditedNearestNeighbours with strategy {under_sampling_strategy}')
-#             renn = RepeatedEditedNearestNeighbours(sampling_strategy=under_sampling_strategy, n_neighbors=3, max_iter=100, kind_sel='all', n_jobs=-1)
-#             x, y = renn.fit_resample(x, y)
-#         elif under_sampling == 'allknn':
-#             print(f'Applying AllKNN with strategy {under_sampling_strategy}')
-#             allknn = AllKNN(sampling_strategy=under_sampling_strategy, n_neighbors=3, kind_sel='all', allow_minority=True, n_jobs=-1)
-#             x, y = allknn.fit_resample(x, y)
-#         elif under_sampling == 'cnn':
-#             print(f'Applying CondensedNearestNeighbour with strategy {under_sampling_strategy}')
-#             cnn = CondensedNearestNeighbour(sampling_strategy=under_sampling_strategy, n_neighbors=1, random_state=random_state, n_jobs=-1)
-#             x, y = cnn.fit_resample(x, y)
-#         elif under_sampling == 'cc':
-#             print(f'Applying ClusterCentroids with strategy {under_sampling_strategy}')
-#             cc = ClusterCentroids(sampling_strategy=under_sampling_strategy, random_state=random_state, voting='soft')
-#             x, y = cc.fit_resample(x, y)
-#         elif under_sampling == 'nm':
-#             print(f'Applying NearMiss(version=1) with strategy {under_sampling_strategy}')
-#             nm = NearMiss(sampling_strategy=under_sampling_strategy, version=1, n_neighbors=3, n_jobs=-1)
-#             x, y = nm.fit_resample(x, y)
-#         elif under_sampling == 'random_under_sampler':
-#             print(f'Applying RandomUnderSampler with strategy {under_sampling_strategy}')
-#             rus = RandomUnderSampler(sampling_strategy=under_sampling_strategy, random_state=random_state)
-#             x, y = rus.fit_resample(x, y)
+    # Under-sampling
+    if under:
+        if under_sampling == 'tomek_links':
+            print(f'Applying TomekLinks under-sampling.')
+            tom = TomekLinks(n_jobs=-1)
+            x, y = tom.fit_resample(x, y)
+        elif under_sampling == 'enn':
+            print(f'Applying EditedNearestNeighbours with strategy {under_sampling_strategy}')
+            enn = EditedNearestNeighbours(sampling_strategy=under_sampling_strategy, n_neighbors=3, kind_sel='all', n_jobs=-1)
+            x, y = enn.fit_resample(x, y)
+        elif under_sampling == 'renn':
+            print(f'Applying RepeatedEditedNearestNeighbours with strategy {under_sampling_strategy}')
+            renn = RepeatedEditedNearestNeighbours(sampling_strategy=under_sampling_strategy, n_neighbors=3, max_iter=100, kind_sel='all', n_jobs=-1)
+            x, y = renn.fit_resample(x, y)
+        elif under_sampling == 'allknn':
+            print(f'Applying AllKNN with strategy {under_sampling_strategy}')
+            allknn = AllKNN(sampling_strategy=under_sampling_strategy, n_neighbors=3, kind_sel='all', allow_minority=True, n_jobs=-1)
+            x, y = allknn.fit_resample(x, y)
+        elif under_sampling == 'cnn':
+            print(f'Applying CondensedNearestNeighbour with strategy {under_sampling_strategy}')
+            cnn = CondensedNearestNeighbour(sampling_strategy=under_sampling_strategy, n_neighbors=1, random_state=random_state, n_jobs=-1)
+            x, y = cnn.fit_resample(x, y)
+        elif under_sampling == 'cc':
+            print(f'Applying ClusterCentroids with strategy {under_sampling_strategy}')
+            cc = ClusterCentroids(sampling_strategy=under_sampling_strategy, random_state=random_state, voting='soft')
+            x, y = cc.fit_resample(x, y)
+        elif under_sampling == 'nm':
+            print(f'Applying NearMiss(version=1) with strategy {under_sampling_strategy}')
+            nm = NearMiss(sampling_strategy=under_sampling_strategy, version=1, n_neighbors=3, n_jobs=-1)
+            x, y = nm.fit_resample(x, y)
+        elif under_sampling == 'random_under_sampler':
+            print(f'Applying RandomUnderSampler with strategy {under_sampling_strategy}')
+            rus = RandomUnderSampler(sampling_strategy=under_sampling_strategy, random_state=random_state)
+            x, y = rus.fit_resample(x, y)
     
-#     # Combine the resampled features and target into a single DataFrame
-#     df = pd.concat([x, y], axis=1)
+    # Combine the resampled features and target into a single DataFrame
+    df = pd.concat([x, y], axis=1)
     
-#     print(f'Over-sampling and/or under-sampling process completed.')
+    print(f'Over-sampling and/or under-sampling process completed.')
     
-#     return df, x, y
-
-
+    return df, x, y
 
 
 def check_Balance_Regression(df: pd.DataFrame, column_plot: Optional[str] = None, div_number: int = 4) -> pd.DataFrame:
@@ -1597,6 +1761,7 @@ def check_Balance_Regression(df: pd.DataFrame, column_plot: Optional[str] = None
     
     # return temp_df
 
+
 def plot_groupby(df: pd.DataFrame, groupby_cols: List[str], plot: bool = True) -> pd.DataFrame:
     """
     Groups the dataframe by specified columns, computes the mean for numeric columns, and optionally plots the results.
@@ -1639,6 +1804,7 @@ def plot_groupby(df: pd.DataFrame, groupby_cols: List[str], plot: bool = True) -
         print(f"An error occurred: {e}")
         return pd.DataFrame()
 
+
 def plot_pivot(df_group_one, index_col, columns_col):
     grouped_pivot = df_group_one.pivot(index=index_col, columns=columns_col)
     print(grouped_pivot)
@@ -1660,6 +1826,7 @@ def plot_pivot(df_group_one, index_col, columns_col):
     plt.show()
 
     return grouped_pivot
+
 
 def plot_pivot_2(df: pd.DataFrame, index_col: str, columns_col: str, values_col: Optional[str] = None, plot: bool = True) -> pd.DataFrame:
     """
@@ -1712,6 +1879,7 @@ def plot_pivot_2(df: pd.DataFrame, index_col: str, columns_col: str, values_col:
     except Exception as e:
         print(f"An error occurred: {e}")
         return pd.DataFrame()
+
 
 def plot_groupby_and_pivot(df: pd.DataFrame, groupby_cols: List[str], index_col: str, columns_col: str, plot_group: bool = True, plot_pivot: bool = True) -> Dict[str, pd.DataFrame]:
     """
@@ -1805,6 +1973,7 @@ def plot_groupby_and_pivot(df: pd.DataFrame, groupby_cols: List[str], index_col:
 
     return {'grouped': df_group_one, 'pivoted': grouped_pivot}
 
+
 def calculate_correlation(df: pd.DataFrame, outcome_column: Optional[str] = None, num_results: Optional[int] = 5) -> pd.DataFrame:
     """
     Calculates and prints the Pearson correlation coefficient and p-value for each numeric column in the DataFrame
@@ -1860,7 +2029,6 @@ def calculate_correlation(df: pd.DataFrame, outcome_column: Optional[str] = None
         print(f"The Pearson Correlation Coefficient for {row['Variable']} is {row['Pearson Coefficient']:.4f} with a P-value of P = {row['P-Value']:.4g}")
     
     return results_df
-
 
 
 def Heatmap_Correlation(df: pd.DataFrame, mask: float = 0.5, cmap="YlGnBu", adv_cmap = True,  save_path: Optional[str] = None, annot_size=10, figsize=(20, 14)) -> pd.DataFrame:
@@ -1947,7 +2115,6 @@ def Heatmap_Correlation(df: pd.DataFrame, mask: float = 0.5, cmap="YlGnBu", adv_
     return correlations
 
 
-
 def create_custom_scatter_plot(df: pd.DataFrame, 
                                x_col: str, 
                                y_col: str, 
@@ -2012,6 +2179,7 @@ def create_custom_scatter_plot(df: pd.DataFrame,
     plt.show()
     
     logging.info('Scatter plot created successfully.')
+
 
 def plot_histograms(df: pd.DataFrame, column: Optional[Union[str, None]] = None, save_plots: bool = False, palette: str = 'magma',
                             bins: Optional[Union[int, list]] = 30, edgecolor: str = 'black', alpha: float = 0.9, kde: bool = True,
@@ -2093,6 +2261,20 @@ def plot_histograms(df: pd.DataFrame, column: Optional[Union[str, None]] = None,
         print(f"An error occurred: {e}")
 
 
+def save_encoder(encoder, column: str, encoder_abbr: str):
+    """Save encoder object to 'pickle' folder with a structured name."""
+    if not os.path.exists('pickle'):
+        os.makedirs('pickle')  # Create 'pickle' folder if not exists
+    
+    # Format file name: column_name_encoder.pkl
+    filename = f"{column.replace(' ', '_')}_{encoder_abbr}.pkl"
+    filepath = os.path.join('pickle', filename)
+    
+    with open(filepath, 'wb') as file:
+        pickle.dump(encoder, file)
+    print(f"Encoder for '{column}' saved as '{filename}' in 'pickle/' folder.")
+
+
 def encode_column(
     df: pd.DataFrame, 
     columns: Union[str, List[str]], 
@@ -2108,51 +2290,14 @@ def encode_column(
     binary_default: bool = True
 ) -> pd.DataFrame:
     """
-    Encodes one or more columns in the dataframe using the specified method.
-
-    Parameters:
-    ----------
-    df (pd.DataFrame): The dataframe containing the column(s) to be encoded.
-    columns (Union[str, List[str]]): The name of the column or a list of column names to be encoded.
-    method (Literal['get_dummies', 'label', 'ordinal', 'binary', 'target', 
-                    'dict_vectorizer', 'feature_hasher', 'label_binarizer', 
-                    'multi_label_binarizer', 'frequency']): The encoding method to use. 
-                    Options are 'get_dummies' (one_hot), 'label', 'ordinal', 
-                    'binary', 'target', 'dict_vectorizer', 'feature_hasher', 
-                    'label_binarizer', 'multi_label_binarizer', 'frequency'. Default is 'get_dummies'.
-    ordinal_categories (Optional[List[str]]): Categories for ordinal encoding if method is 'ordinal'. Default is None.
-    target (Optional[str]): Target column for target encoding. Default is None.
-    n_features (Optional[int]): Number of features for feature hasher. Default is None.
-    
-    Examples:
-    --------
-    One-hot encoding for a single column
-    >>> df_encoded = encode_column(df, 'column_name', method='get_dummies')
-    Ordinal encoding with specified categories
-    >>> df_encoded = encode_column(df, 'column_name', method='ordinal', ordinal_categories=['low', 'medium', 'high'])
-    Binary encoding for a single column
-    >>> df_encoded = encode_column(df, 'column_name', method='binary')
-    Target encoding for a single column
-    >>> df_encoded = encode_column(df, 'column_name', method='target', target='target_column')
-    Feature hashing with a specified number of features
-    >>> df_encoded = encode_column(df, 'column_name', method='feature_hasher', n_features=10)
-    Frequency encoding for a single column
-    >>> df_encoded = encode_column(df, 'column_name', method='frequency')
-
-    Returns:
-    -------
-    pd.DataFrame: The dataframe with the encoded column(s).
-
+    Encodes columns and saves encoders to the 'pickle' folder.
     """
-    
-    def binary_encode(df: pd.DataFrame, column: str, binary_1: str = None, binary_0: str = None) -> pd.DataFrame:
+    def binary_encode(df: pd.DataFrame, column: str) -> pd.DataFrame:
         unique_vals = df[column].dropna().unique()
         if len(unique_vals) != 2:
-            raise ValueError("Column must have exactly two unique non-NaN values.")
-        if binary_1 is not None and binary_0 is not None:
-            df[column] = df[column].apply(lambda x: 1 if x == binary_1 else (0 if x == binary_0 else np.nan))
-        elif binary_1 not in unique_vals or binary_0 not in unique_vals or binary_1 is None or binary_0 is None:
-            df[column] = df[column].apply(lambda x: 1 if x == unique_vals[0] else (0 if x == unique_vals[1] else np.nan))
+            raise ValueError("Binary encoding requires exactly two unique non-NaN values.")
+        df[column] = df[column].apply(lambda x: 1 if x == unique_vals[0] else 0)
+        save_encoder({'binary_values': unique_vals}, column, 'BE')
         return df
 
     def label_encode(df: pd.DataFrame, column: str) -> pd.DataFrame:
@@ -2160,75 +2305,37 @@ def encode_column(
         non_nan_mask = df[column].notna()
         le.fit(df.loc[non_nan_mask, column])
         df.loc[non_nan_mask, column] = le.transform(df.loc[non_nan_mask, column])
+        save_encoder(le, column, 'LE')
         return df
 
     def ordinal_encode(df: pd.DataFrame, column: str, categories: List[str]) -> pd.DataFrame:
         oe = OrdinalEncoder(categories=[categories], handle_unknown='use_encoded_value', unknown_value=np.nan)
-        nan_mask = df[column].isna()
         df[column] = oe.fit_transform(df[[column]])
-        df.loc[nan_mask, column] = np.nan
+        save_encoder(oe, column, 'OE')
         return df
 
     def get_dummies(df: pd.DataFrame, column: str) -> pd.DataFrame:
-        nan_mask = df[column].isna()
         dummies = pd.get_dummies(df[column], prefix=column, prefix_sep='_', drop_first=True, dtype=float)
         df = pd.concat([df, dummies], axis=1)
-        df.loc[nan_mask, dummies.columns] = pd.NA
+        save_encoder({'dummies_columns': dummies.columns.tolist()}, column, 'OHE')
         df = df.drop(column, axis=1)
         return df
 
-    def target_encode(df: pd.DataFrame, column: str, target: str) -> pd.DataFrame:
-        te = TargetEncoder(cols=[column])
-        df[column] = te.fit_transform(df[column], df[target])
-        return df
-
-    def dict_vectorize(df: pd.DataFrame, column: str) -> pd.DataFrame:
-        dv = DictVectorizer(sparse=False)
-        dict_data = df[column].apply(lambda x: {column: x})
-        transformed = dv.fit_transform(dict_data)
-        df = df.drop(column, axis=1)
-        df = pd.concat([df, pd.DataFrame(transformed, columns=dv.get_feature_names_out())], axis=1)
-        return df
-
-    def feature_hash(df: pd.DataFrame, column: str, n_features: int) -> pd.DataFrame:
-        fh = FeatureHasher(n_features=n_features, input_type='string')
-        transformed = fh.transform(df[column].astype(str)).toarray()
-        df = df.drop(column, axis=1)
-        df = pd.concat([df, pd.DataFrame(transformed, columns=[f'{column}_hashed_{i}' for i in range(n_features)])], axis=1)
-        return df
-
-    def label_binarize(df: pd.DataFrame, column: str) -> pd.DataFrame:
-        lb = LabelBinarizer()
-        transformed = lb.fit_transform(df[column])
-        df = df.drop(column, axis=1)
-        df = pd.concat([df, pd.DataFrame(transformed, columns=lb.classes_)], axis=1)
-        return df
-
-    def multi_label_binarize(df: pd.DataFrame, column: str) -> pd.DataFrame:
-        mlb = MultiLabelBinarizer()
-        transformed = mlb.fit_transform(df[column])
-        df = df.drop(column, axis=1)
-        df = pd.concat([df, pd.DataFrame(transformed, columns=mlb.classes_)], axis=1)
-        return df
-    
     def frequency_encode(df: pd.DataFrame, column: str) -> pd.DataFrame:
         freq = df[column].value_counts() / len(df)
         df[column] = df[column].map(freq)
+        save_encoder({'frequency_map': freq.to_dict()}, column, 'FE')
         return df
-
+    
+    # Ensure columns is a list
     if isinstance(columns, str):
         columns = [columns]
     
     for column in columns:
         if column not in df.columns:
             raise ValueError(f"Column '{column}' does not exist in the dataframe")
-        
-        if binary_default:
-            unique_vals = df[column].value_counts()
-            if len(unique_vals) == 2:
-                df = binary_encode(df, column)
-                continue
 
+        # Apply chosen encoding method
         if method == 'binary':
             df = binary_encode(df, column)
         elif method == 'label':
@@ -2239,25 +2346,11 @@ def encode_column(
             df = ordinal_encode(df, column, ordinal_categories)
         elif method == 'get_dummies':
             df = get_dummies(df, column)
-        elif method == 'target':
-            if target is None:
-                raise ValueError("Target column must be provided for target encoding")
-            df = target_encode(df, column, target)
-        elif method == 'dict_vectorizer':
-            df = dict_vectorize(df, column)
-        elif method == 'feature_hasher':
-            if n_features is None:
-                raise ValueError("Number of features must be provided for feature hasher")
-            df = feature_hash(df, column, n_features)
-        elif method == 'label_binarizer':
-            df = label_binarize(df, column)
-        elif method == 'multi_label_binarizer':
-            df = multi_label_binarize(df, column)
         elif method == 'frequency':
             df = frequency_encode(df, column)
         else:
             raise ValueError(f"Encoding method '{method}' is not supported")
-    
+
     return df
 
 
@@ -2389,7 +2482,7 @@ def get_x_y_TT_shape(x_train: pd.DataFrame, y_train: pd.Series, x_test: pd.DataF
         print_shape(y_test, 'y_test')
     except Exception as e:
         raise ValueError(f"An error occurred while printing shapes: {e}")
-    
+
 
 def get_x_y_TVT_shape(x_train: pd.DataFrame, y_train: pd.Series, x_valid: pd.DataFrame, y_valid: pd.Series, x_test: pd.DataFrame, y_test: pd.Series) -> None:
     """
@@ -2489,7 +2582,8 @@ def feature_selection(
     n_jobs: int = -1,
     task: Literal['classification', 'regression'] = 'classification',
     lasso_alpha: float = 0.01,
-    ridge_alpha: float = 0.01
+    ridge_alpha: float = 0.01,
+    output_dir: str = 'pickle/feature_selection'
 ) -> Tuple[pd.DataFrame, Union[object, BorutaPy], dict]:
     """
     Perform feature selection on the given dataset, including categorical encoding.
@@ -2531,7 +2625,7 @@ def feature_selection(
         - The selector object
         - A dictionary mapping encoded column names to their original names
     """
-    
+    os.makedirs(output_dir, exist_ok=True)
     # Preprocess the data
     x = x.replace([np.inf, -np.inf], np.nan)  # Replace infinity with NaN
     
@@ -2686,184 +2780,20 @@ def feature_selection(
     # Create the final DataFrame with selected features
     x_final = x[original_selected_features]
 
-    return x_final, selector, column_mapping
+    # Save the selector model
+    selector_path = os.path.join(output_dir, f"{method}_selector.pkl")
+    with open(selector_path, 'wb') as file:
+        pickle.dump(selector, file)
+    print(f"Feature selection model saved to '{selector_path}'.")
 
-
-def feature_selection_1(
-    x: pd.DataFrame, 
-    y: pd.Series, 
-    method: Literal[
-        'SelectKBest', 'SelectFpr', 'SelectFdr', 'SelectFwe', 'SelectPercentile', 
-        'GenericUnivariateSelect', 'VarianceThreshold', 'RFE', 'RFECV', 
-        'SequentialFeatureSelector', 'ExhaustiveFeatureSelector', 'SelectFromModel', 
-        'TPOTClassifier', 'TPOTRegressor', 'Boruta', 'InformationGain',
-        'Lasso', 'Ridge'] = 'SelectKBest', 
-    stat_method: Optional[Literal[
-        'f_regression', 'chi2', 'f_classif', 'mutual_info_classif', 'mutual_info_regression', 
-        'pearsonr', 'spearmanr', 'kendalltau'
-    ]] = 'f_regression', 
-    k: int = 10, 
-    percentile: int = 10, 
-    alpha: float = 0.05, 
-    threshold: float = 0.0, 
-    n_features_to_select: Optional[int] = None, 
-    cv: int = 5, 
-    scoring: Optional[str] = None, 
-    direction: Literal['forward', 'backward'] = 'forward', 
-    estimator: Optional[Union[RandomForestClassifier, RandomForestRegressor]] = None, 
-    generations: int = 5, 
-    population_size: int = 50, 
-    random_state: int = 42, 
-    verbosity: int = 2,
-    step: int = 1,
-    n_jobs: int = -1,
-    task: Literal['classification', 'regression'] = 'classification',
-    lasso_alpha: float = 0.01,
-    ridge_alpha: float = 0.01
-) -> Tuple[pd.DataFrame, Union[object, BorutaPy]]:
-    """
-    Perform feature selection on the given dataset.
-
-    Parameters:
-    x (pd.DataFrame): Input features.
-    y (pd.Series): Target variable.
-    method (str): Feature selection method to use. Valid options are:
-        'SelectKBest', 'SelectFpr', 'SelectFdr', 'SelectFwe', 'SelectPercentile',
-        'GenericUnivariateSelect', 'VarianceThreshold', 'RFE', 'RFECV',
-        'SequentialFeatureSelector', 'ExhaustiveFeatureSelector', 'SelectFromModel',
-        'TPOTClassifier', 'TPOTRegressor', 'Boruta', 'InformationGain',
-        'Lasso', 'Ridge'.
-    stat_method (str, optional): Statistical method for univariate feature selection. Valid options are:
-        'f_regression', 'chi2', 'f_classif', 'mutual_info_classif', 'mutual_info_regression',
-        'pearsonr', 'spearmanr', 'kendalltau'.
-    k (int): Number of top features to select (used with some methods).
-    percentile (int): Percentile of top features to select (used with some methods).
-    alpha (float): Significance level for statistical tests (used with some methods).
-    threshold (float): Threshold for variance (used with VarianceThreshold).
-    n_features_to_select (int, optional): Number of features to select (used with some methods).
-    cv (int): Number of cross-validation folds (used with some methods).
-    scoring (str, optional): Scoring metric for cross-validation (used with some methods).
-    direction (str): Direction of feature selection ('forward' or 'backward', used with SequentialFeatureSelector).
-    estimator (object, optional): Estimator to use for model-based selection.
-    generations (int): Number of generations for TPOT.
-    population_size (int): Population size for TPOT.
-    random_state (int): Random seed.
-    verbosity (int): Verbosity level for TPOT.
-    step (int): Step size for RFE and RFECV.
-    n_jobs (int): Number of jobs to run in parallel.
-    task (str): Task type ('classification' or 'regression').
-    lasso_alpha (float): Regularization strength for Lasso.
-    ridge_alpha (float): Regularization strength for Ridge.
-
-    Returns:
-    Tuple[pd.DataFrame, Union[object, BorutaPy]]: Transformed x and the selector object.
-    """
-    # Default estimator if none is provided
-    if estimator is None:
-        if task == 'classification':
-            estimator = RandomForestClassifier(random_state=random_state)
-        elif task == 'regression':
-            estimator = RandomForestRegressor(random_state=random_state)
-        else:
-            raise ValueError("Invalid task. Choose 'classification' or 'regression'.")
-
-    # Univariate feature selection methods
-    stat_methods = {
-        'f_regression': f_regression,
-        'chi2': chi2,
-        'f_classif': f_classif,
-        'mutual_info_classif': mutual_info_classif,
-        'mutual_info_regression': mutual_info_regression,
-        'pearsonr': lambda X, y: tuple(zip(*[pearsonr(x, y) for x in X.T])),
-        'spearmanr': lambda X, y: tuple(zip(*[spearmanr(x, y) for x in X.T])),
-        'kendalltau': lambda X, y: tuple(zip(*[kendalltau(x, y) for x in X.T]))
-    }
+    # Save the selected feature names
+    selected_features_path = os.path.join(output_dir, f"{method}_selected_features.pkl")
+    with open(selected_features_path, 'wb') as file:
+        pickle.dump(original_selected_features, file)
+    print(f"Selected features saved to '{selected_features_path}'.")
     
-    if stat_method and stat_method not in stat_methods:
-        raise ValueError(f"Invalid stat_method '{stat_method}' specified. "
-                         f"Valid options are: {', '.join(stat_methods.keys())}")
-
-    if method == 'SelectKBest':
-        selector = SelectKBest(stat_methods[stat_method], k=k)
-    elif method == 'SelectFpr':
-        selector = SelectFpr(stat_methods[stat_method], alpha=alpha)
-    elif method == 'SelectFdr':
-        selector = SelectFdr(stat_methods[stat_method], alpha=alpha)
-    elif method == 'SelectFwe':
-        selector = SelectFwe(stat_methods[stat_method], alpha=alpha)
-    elif method == 'SelectPercentile':
-        selector = SelectPercentile(stat_methods[stat_method], percentile=percentile)
-    elif method == 'GenericUnivariateSelect':
-        selector = GenericUnivariateSelect(stat_methods[stat_method], mode='percentile', param=percentile)
-    elif method == 'VarianceThreshold':
-        selector = VarianceThreshold(threshold=threshold)
-    elif method == 'RFE':
-        selector = RFE(estimator, n_features_to_select=n_features_to_select, step=step)
-    elif method == 'RFECV':
-        selector = RFECV(estimator,min_features_to_select = n_features_to_select, step=step, cv=cv, scoring=scoring, n_jobs=n_jobs)
-    elif method == 'SequentialFeatureSelector':
-        selector = SequentialFeatureSelector(estimator, n_features_to_select=n_features_to_select, direction=direction, scoring=scoring, cv=cv, n_jobs=n_jobs)
-    elif method == 'ExhaustiveFeatureSelector':
-        selector = ExhaustiveFeatureSelector(estimator, min_features=1, max_features=n_features_to_select or x.shape[1], scoring=scoring, cv=cv, n_jobs=n_jobs)
-    elif method == 'SelectFromModel':
-        if task == 'classification':
-            base_estimator = ExtraTreesClassifier(n_estimators=50, random_state=random_state)
-        else:
-            base_estimator = ExtraTreesRegressor(n_estimators=50, random_state=random_state)
-        selector = SelectFromModel(base_estimator, threshold='median')
-    elif method == 'TPOTClassifier':
-        if task != 'classification':
-            raise ValueError("TPOTClassifier is only valid for classification tasks.")
-        selector = TPOTClassifier(generations=generations, population_size=population_size, 
-                                  cv=cv, random_state=random_state, verbosity=verbosity, n_jobs=n_jobs)
-    elif method == 'TPOTRegressor':
-        if task != 'regression':
-            raise ValueError("TPOTRegressor is only valid for regression tasks.")
-        selector = TPOTRegressor(generations=generations, population_size=population_size, 
-                                 cv=cv, random_state=random_state, verbosity=verbosity, n_jobs=n_jobs)
-    elif method == 'Boruta':
-        if task == 'classification':
-            base_estimator = RandomForestClassifier(n_jobs=n_jobs, random_state=random_state)
-        else:
-            base_estimator = RandomForestRegressor(n_jobs=n_jobs, random_state=random_state)
-        selector = BorutaPy(base_estimator, n_estimators='auto', verbose=2, random_state=random_state)
-    elif method == 'InformationGain':
-        if task == 'classification':
-            selector = SelectKBest(mutual_info_classif, k=k)
-        else:
-            selector = SelectKBest(mutual_info_regression, k=k)
-    elif method == 'Lasso':
-        selector = SelectFromModel(Lasso(alpha=lasso_alpha, random_state=random_state))
-    elif method == 'Ridge':
-        selector = SelectFromModel(Ridge(alpha=ridge_alpha, random_state=random_state))
-    else:
-        raise ValueError(f"Invalid method '{method}' specified.")
-
-    # Fit selector to training data
-    if method in ['TPOTClassifier', 'TPOTRegressor']:
-        selector.fit(x, y)
-        fitted_pipeline = selector.fitted_pipeline_
-        x_new = fitted_pipeline.transform(x)
-        feature_names = x.columns[selector._fitted_imputer.feature_mask_]
-        x_new = pd.DataFrame(x_new, columns=feature_names, index=x.index)
-    elif method == 'Boruta':
-        # Boruta requires scaled input
-        scaler = StandardScaler()
-        x_scaled = scaler.fit_transform(x)
-        selector.fit(x_scaled, y)
-        x_new = x.iloc[:, selector.support_]
-    elif method == 'ExhaustiveFeatureSelector':
-        selector.fit(x, y, params={'sample_weight': None})
-        x_new = selector.transform(x)
-    else:
-        selector.fit(x, y)
-        x_new = selector.transform(x)
-        if hasattr(selector, 'get_support'):
-            feature_names = x.columns[selector.get_support()]
-            x_new = pd.DataFrame(x_new, columns=feature_names, index=x.index)
-
-    return x_new, selector
-
+    
+    return x_final, selector, column_mapping
 
 
 def feature_selection_1(
@@ -2894,17 +2824,16 @@ def feature_selection_1(
     verbosity: int = 2,
     step = 1,
     n_jobs =-1,
-    task: Literal['classification', 'regression'] = 'classification'
+    task: Literal['classification', 'regression'] = 'classification',
+    output_dir: str = 'pickle/feature_selection'
 ) -> Tuple[pd.DataFrame, pd.DataFrame, Optional[pd.DataFrame]]:
     """
     Perform feature selection on the given dataset.
 
-    Parameters:
-    [... same as before ...]
-
     Returns:
     Tuple[pd.DataFrame, pd.DataFrame, Optional[pd.DataFrame]]: Transformed x_train, x_test, and optionally x_valid.
     """
+    os.makedirs(output_dir, exist_ok=True)
     # Default estimator if none is provided
     if estimator is None:
         if task == 'classification':
@@ -3000,6 +2929,19 @@ def feature_selection_1(
         # x_test_new = pd.DataFrame(selector.transform(x_test), columns=x_test.columns[selector.get_support()])
         # x_valid_new = pd.DataFrame(selector.transform(x_valid), columns=x_valid.columns[selector.get_support()])
 
+        # Save the selector model
+    selector_path = os.path.join(output_dir, f"{method}_selector.pkl")
+    with open(selector_path, 'wb') as file:
+        pickle.dump(selector, file)
+    print(f"Feature selection model saved to '{selector_path}'.")
+
+    # Save the selected feature names
+    selected_features = x_train.columns[selector.get_support()]
+    selected_features_path = os.path.join(output_dir, f"{method}_selected_features.pkl")
+    with open(selected_features_path, 'wb') as file:
+        pickle.dump(selected_features.tolist(), file)
+    print(f"Selected features saved to '{selected_features_path}'.")
+    
     return x_train_new, x_test_new, x_valid_new, selector
 
 
@@ -3033,8 +2975,14 @@ def dimensionality_reduction(
     gamma: Optional[float] = None,
     degree: int = 3,
     coef0: float = 1.0,
-    n_jobs: int = -1
+    n_jobs: int = -1,
+    output_dir: str = "pickle/dimensionality_reduction"
 ) -> Tuple[pd.DataFrame, pd.DataFrame, Optional[pd.DataFrame], Union[PCA, LDA, FactorAnalysis, TruncatedSVD, FastICA, TSNE, umap.UMAP, KernelPCA, Model]]:
+    """
+    Perform dimensionality reduction and save the model and transformed datasets using pickle.
+    """
+    os.makedirs(output_dir, exist_ok=True)
+
     if method == 'LDA':
         if y_train is None:
             raise ValueError("y_train must be provided for LDA.")
@@ -3044,6 +2992,7 @@ def dimensionality_reduction(
         if n_components > max_components:
             n_components = max_components
     
+    # Initialize the model
     if method == 'PCA':
         model = PCA(n_components=n_components, whiten=whiten, svd_solver=svd_solver, random_state=random_state)
     elif method == 'LDA':
@@ -3061,7 +3010,6 @@ def dimensionality_reduction(
         x_train_new = model.fit_transform(x_train)
         x_test_new = model.fit_transform(x_test)
         x_valid_new = model.fit_transform(x_valid) if x_valid is not None else None
-        return pd.DataFrame(x_train_new), pd.DataFrame(x_test_new), pd.DataFrame(x_valid_new) if x_valid is not None else None, model
     elif method == 'UMAP':
         model = umap.UMAP(n_components=n_components, n_neighbors=n_neighbors, min_dist=min_dist, metric=metric, random_state=random_state, n_jobs=n_jobs)
     elif method == 'KernelPCA':
@@ -3094,36 +3042,54 @@ def dimensionality_reduction(
         x_train_new = encoder.predict(x_train)
         x_test_new = encoder.predict(x_test)
         x_valid_new = encoder.predict(x_valid) if x_valid is not None else None
-        return pd.DataFrame(x_train_new), pd.DataFrame(x_test_new), pd.DataFrame(x_valid_new) if x_valid is not None else None, autoencoder
+
+        model = autoencoder
     else:
         raise ValueError(f"Invalid method '{method}' specified. "
                          f"Valid options are: 'PCA', 'LDA', 'FactorAnalysis', 'TruncatedSVD', 'ICA', "
                          f"'TSNE', 'UMAP', 'Autoencoder', 'KernelPCA'.")
 
     if method == 'LDA':
-        model.fit(x_train, y_train)  # LDA requires y_train for fitting
-    else:
+        model.fit(x_train, y_train)
+    elif method not in ['TSNE', 'UMAP', 'Autoencoder']:
         model.fit(x_train)
 
-    x_train_new = model.transform(x_train)
-    x_test_new = model.transform(x_test)
-    x_valid_new = model.transform(x_valid) if x_valid is not None else None
+    if method not in ['TSNE', 'UMAP', 'Autoencoder']:
+        x_train_new = model.transform(x_train)
+        x_test_new = model.transform(x_test)
+        x_valid_new = model.transform(x_valid) if x_valid is not None else None
 
-    return x_train_new, x_test_new, x_valid_new if x_valid is not None else None, model
+    # Save the dimensionality reduction model
+    model_path = os.path.join(output_dir, f"{method}_model.pkl")
+    with open(model_path, 'wb') as file:
+        pickle.dump(model, file)
+    print(f"Dimensionality reduction model saved to '{model_path}'.")
+
+    # Save the transformed datasets
+    for data, name in zip([x_train_new, x_test_new, x_valid_new], ['x_train', 'x_test', 'x_valid']):
+        if data is not None:
+            data_path = os.path.join(output_dir, f"{name}_{method}.pkl")
+            with open(data_path, 'wb') as file:
+                pickle.dump(pd.DataFrame(data), file)
+            print(f"Transformed dataset '{name}' saved to '{data_path}'.")
+
+    return pd.DataFrame(x_train_new), pd.DataFrame(x_test_new), pd.DataFrame(x_valid_new) if x_valid is not None else None, model
 
 
 def scale_data(x_train: Union[np.ndarray, pd.DataFrame], 
                x_test: Union[np.ndarray, pd.DataFrame], 
                x_valid: Optional[Union[np.ndarray, pd.DataFrame]] = None, 
-               scaler_type: Literal['standard', 'minmax', 'robust', 'maxabs', 'quantile', 'power', 'l2', 'log'] = 'standard') -> Union[Tuple[np.ndarray, np.ndarray], Tuple[np.ndarray, np.ndarray, np.ndarray]]:
+               scaler_type: Literal['standard', 'minmax', 'robust', 'maxabs', 'quantile', 'power', 'l2', 'log'] = 'standard',
+               save_scaler_path: Optional[str] = 'pickle/scaler.pkl') -> Union[Tuple[np.ndarray, np.ndarray], Tuple[np.ndarray, np.ndarray, np.ndarray]]:
     """
-    Scales the input data using the specified scaler type.
+    Scales the input data using the specified scaler type and saves the scaler to a pickle file.
     
     Parameters:
     x_train (Union[np.ndarray, pd.DataFrame]): Training data.
     x_test (Union[np.ndarray, pd.DataFrame]): Test data.
     x_valid (Optional[Union[np.ndarray, pd.DataFrame]]): Validation data (optional).
     scaler_type (str): Type of scaler to use ('standard', 'minmax', 'robust', 'maxabs', 'quantile', 'power', 'l2', 'log'). Default is 'standard'.
+    save_scaler_path (Optional[str]): Path to save the fitted scaler as a pickle file. Default is 'pickle/scaler.pkl'.
     
     Returns:
     Union[Tuple[np.ndarray, np.ndarray], Tuple[np.ndarray, np.ndarray, np.ndarray]]: Returns the scaled (x_train, x_test) if x_valid is not provided,
@@ -3165,17 +3131,26 @@ def scale_data(x_train: Union[np.ndarray, pd.DataFrame],
             else:
                 return log_transform(x_train, x_valid, x_test)
         
+        # Fit the scaler on the training data
         x_train_scaled = scaler.fit_transform(x_train)
         x_test_scaled = scaler.transform(x_test)
         
+        # Save the scaler to pickle
+        if save_scaler_path:
+            os.makedirs(os.path.dirname(save_scaler_path), exist_ok=True)
+            with open(save_scaler_path, 'wb') as file:
+                pickle.dump(scaler, file)
+            print(f"Scaler saved to '{save_scaler_path}'.")
+        
         if x_valid is not None:
             x_valid_scaled = scaler.transform(x_valid)
-            return x_train_scaled, x_test_scaled, x_valid_scaled
+            return x_train_scaled, x_test_scaled, x_valid_scaled, scaler
         else:
-            return x_train_scaled, x_test_scaled
+            return x_train_scaled, x_test_scaled, scaler
     
     except Exception as e:
         raise ValueError(f"An error occurred while scaling the data: {e}")
+
 
 def get_cross_validator(cv_type: Literal['KFold', 'StratifiedKFold', 'LeaveOneOut', 'LeavePOut', 'RepeatedKFold', 'TimeSeriesSplit'] = 'KFold', 
                         cv=5, shuffle=True, random_state=42, LeavePOut_p=2, RepeatedKFold_n_repeats=10):
@@ -3194,7 +3169,6 @@ def get_cross_validator(cv_type: Literal['KFold', 'StratifiedKFold', 'LeaveOneOu
     else:
         raise ValueError("Invalid cv_type. Choose from 'KFold', 'StratifiedKFold', 'LeaveOneOut', 'LeavePOut', 'RepeatedKFold', 'TimeSeriesSplit'.")
     return type_cross_valid
-
 
 
 def grid_search_classifier(
@@ -3806,8 +3780,7 @@ def grid_search_classifier_with_progress(
     return best_params, best_score, best_estimator
 
 
-
-def grid_search_regressor(
+def grid_search_regression(
         model_name: Literal['LinearRegression', 'Ridge', 'Lasso', 'ElasticNet', 'KNN', 'SVR', 
                             'DecisionTree', 'RandomForest', 'GradientBoosting', 'XGBoost', 
                             'ExtraTrees', 'Bagging', 'AdaBoost', 'Stacking'],
@@ -4105,7 +4078,6 @@ def grid_search_regressor(
     best_estimator = grid_search.best_estimator_
     
     return best_params, best_score, best_estimator
-
 
 
 def random_search_classifier(
@@ -4407,8 +4379,7 @@ def random_search_classifier(
     return best_params, best_score, best_estimator
 
 
-
-def random_search_regressor(model_name: Literal['LinearRegression', 'Ridge', 'Lasso', 'ElasticNet', 'KNN', 'SVR', 
+def random_search_regression(model_name: Literal['LinearRegression', 'Ridge', 'Lasso', 'ElasticNet', 'KNN', 'SVR', 
                             'DecisionTree', 'RandomForest', 'GradientBoosting', 'XGBoost', 
                             'ExtraTrees', 'Bagging', 'AdaBoost', 'Stacking'],
                             X_train: np.ndarray, 
@@ -4765,6 +4736,7 @@ def plot_feature_importance(
     except Exception as e:
         print(f"An error occurred while plotting: {e}")
 
+
 def get_classifier(
     model_name: Literal[
         'logistic_regression', 'gaussian_nb', 'multinomial_nb', 'bernoulli_nb',
@@ -4846,7 +4818,7 @@ def get_classifier(
     return model
 
 
-def get_regressor(
+def get_regression(
     model_name: Literal[
         'linear_regression', 'ridge_regression', 'lasso_regression', 'elasticnet_regression',
         'kneighbors_regressor', 'svr', 'decision_tree_regressor', 'random_forest_regressor',
@@ -4926,8 +4898,7 @@ def get_regressor(
     return model
 
 
-
-def Check_Overfitting_Classification(
+def check_overfitting_classification(
     model,
     x: np.ndarray,
     y: np.ndarray,
@@ -4936,7 +4907,7 @@ def Check_Overfitting_Classification(
     x_valid: np.ndarray,
     y_valid: np.ndarray,
     learning_curve_scoring: Literal['accuracy', 'precision', 'recall', 'f1', 'roc_auc'] = 'accuracy',
-    cv_type: Literal['KFold', 'StratifiedKFold', 'LeaveOneOut', 'LeavePOut', 'RepeatedKFold', 'TimeSeriesSplit'] = 'KFold',
+    cv_type: Literal['KFold', 'StratifiedKFold', 'LeaveOneOut', 'LeavePOut', 'RepeatedKFold', 'TimeSeriesSplit'] = 'StratifiedKFold',
     cv: int = 5,
     cv_scoring: Literal['accuracy', 'precision', 'recall', 'f1', 'roc_auc'] = 'accuracy',
     shuffle: bool = True,
@@ -5133,7 +5104,7 @@ def Check_Overfitting_Classification(
     # return results
 
 
-def Check_Overfitting_Regression(
+def check_overfitting_regression(
     model,
     x: np.ndarray,
     y: np.ndarray,
@@ -5189,9 +5160,13 @@ def Check_Overfitting_Regression(
     if learning_curve_scoring in ['neg_mean_squared_error', 'neg_mean_absolute_error']:
         train_scores_mean = -np.mean(train_scores, axis=1)
         valid_scores_mean = -np.mean(valid_scores, axis=1)
+        train_scores_std = -np.std(train_scores, axis=1)
+        valid_scores_std = -np.std(valid_scores, axis=1)
     else:
         train_scores_mean = np.mean(train_scores, axis=1)
         valid_scores_mean = np.mean(valid_scores, axis=1)
+        train_scores_std = np.std(train_scores, axis=1)
+        valid_scores_std = np.std(valid_scores, axis=1)
     
     
     # # Compute the learning curves
@@ -5234,13 +5209,16 @@ def Check_Overfitting_Regression(
 
     if plot:
         plt.figure()
-        plt.plot(train_sizes, train_scores_mean, label='Training Score')
-        plt.plot(train_sizes, valid_scores_mean, label='Validation Score')
+        plt.plot(train_sizes, train_scores_mean, "r-+", label='Training Score')
+        plt.plot(train_sizes, valid_scores_mean, "b-*", label='Validation Score')
+        plt.fill_between(train_sizes, train_scores_mean - train_scores_std, train_scores_mean + train_scores_std, color='r', alpha=0.25)
+        plt.fill_between(train_sizes, valid_scores_mean - valid_scores_std, valid_scores_mean + valid_scores_std, color='b', alpha=0.25)
         plt.xlabel('Training Size')
         plt.ylabel('Score')
         plt.title('Learning Curve')
         plt.legend()
         plt.show()
+        
         
         # # Plot the learning curves
         # plt.figure(figsize=(10, 6))
@@ -5323,7 +5301,8 @@ def plot_confusion_matrix(y_test, y_pred):
     # Display the heatmap
     plt.show()
 
-def evaluate_model_Classification(y_test, y_pred):
+
+def evaluate_model_classification(y_test, y_pred):
     """
     Evaluates a classification model and plots the ROC curve.
 
@@ -5375,6 +5354,7 @@ def evaluate_model_Classification(y_test, y_pred):
     
     return accuracy, recall, precision, f1, roc_auc
 
+
 def evaluate_model_regression(y_test, y_pred):
     """
     Evaluates a regression model and plots the predicted vs. actual values.
@@ -5415,104 +5395,363 @@ def evaluate_model_regression(y_test, y_pred):
     return mae , mse, rmse, r2
 
 
-
 def plots_evaluate_models(
-    data, 
-    labels=None, 
-    categories=None,
+    models_values, 
+    models_names=None, 
+    evaluate_names=None,
     have_overfitting=None,
-    colors=None,
-    title=None, 
-    xlabel=None, 
-    ylabel=None, 
-    palette='magma', 
-    width=0.75, 
+    palette='magma', # viridis, plasma, mako, rainbow, summer, autumn, bone, cool, copper, flag, gray, hot, hsv, nipy_spectral, ocean, pink, spring, winter, Set1, Set2, Set3, tab10, tab20, tab20b, tab20c
+    title='Model Performance Across Different Metrics',
+    xlabel='',
+    ylabel='',
+    width=0.75,
     edgecolor='black',
     linewidth=1.5,
-    hatches: list = None,
-    hatch: bool = True,
-    order: bool = False,
-    figsize=(10, 8),
-    data_labels=True,
-    annote_num=1
-
+    hatches=None,
+    hatch=False,
+    figsize=(18, 6),
+    annote_num=3
 ):
-    if xlabel is None:
-        xlabel = 'Category'
-    if ylabel is None:
-        ylabel = 'Values'
-    if title is None:
-        title = 'Multiple Bar Plots'
+    """
+    Create an enhanced grouped bar plot of model performance metrics.
     
-    if not isinstance(data, pd.DataFrame):
-        if isinstance(data[0], (list, np.ndarray)):
-            df = pd.DataFrame(data).T
-        else:
-            df = pd.DataFrame(data, columns=['Values'])
+    Parameters:
+    - models_values: 2D list of performance values 
+    - models_names: List of model names
+    - evaluate_names: List of metric names
+    - have_overfitting: List indicating overfitting status for each model
+    - Additional styling parameters with default values
+    """
+    # Prepare data
+    num_models = len(models_values)
+    num_metrics = len(models_values[0])
+    
+    if models_names is None:
+        models_names = [f'Model {i+1}' for i in range(num_models)]
+    
+    if evaluate_names is None:
+        evaluate_names = [f'Metric {i+1}' for i in range(num_metrics)]
+    
+    # Ensure have_overfitting is the correct length
+    if have_overfitting is None:
+        have_overfitting = [0] * num_models
     else:
-        df = data.copy()
+        # Ensure have_overfitting is exactly as long as the number of models
+        have_overfitting = list(have_overfitting)[:num_models]
+        have_overfitting.extend([0] * (num_models - len(have_overfitting)))
     
-    if labels:
-        df.columns = labels
+    # Create DataFrame
+    df = pd.DataFrame(models_values, columns=evaluate_names)
+    df['Model'] = models_names
     
-    if categories:
-        df['Category'] = categories
-    else:
-        df['Category'] = [f'Category {i+1}' for i in range(len(df))]
+    # Melt the DataFrame
+    df_melted = df.melt(id_vars='Model', var_name='Metric', value_name='Value')
     
-    df_melted = df.melt(id_vars='Category', var_name='Dataset', value_name='Value')
-    
+    # Set up the plot
     plt.figure(figsize=figsize)
     
+    # Prepare hatches
     if hatch and not hatches:
-        hatches_list = random.sample(['X', 'oo', 'O|', '/', '+', '++', '--', '-\\', 'xx', '*-', '\\\\', '|*', '\\', 'OO', 'o', '**', 'o-', '*', '//', '||', '+o', '..', '/o', 'O.', '\\|', 'x*', '|', '-', None], len(df['Category'].unique()))
+        hatches_list = random.sample(['X', 'oo', 'O|', '/', '+', '++', '--', '-\\', 'xx', '*-', '\\\\', '|*', '\\', 'OO', 'o', '**', 'o-', '*', '//', '||', '+o', '..', '/o', 'O.', '\\|', 'x*', '|', '-', None], len(evaluate_names))
     else:
         hatches_list = hatches
     
-    if order:
-        ordered_x = df_melted.groupby('Category')['Value'].sum().sort_values(ascending=False).index
-        ax = sns.barplot(data=df_melted, x='Category', y='Value', hue='Dataset', palette=colors if colors else palette, errorbar=None, order=ordered_x, width=width)
-    else:
-        ax = sns.barplot(data=df_melted, x='Category', y='Value', hue='Dataset', palette=colors if colors else palette, errorbar=None, width=width)
+    # Create the plot
+    ax = sns.barplot(
+        data=df_melted, 
+        x='Model', 
+        y='Value', 
+        hue='Metric', 
+        palette=palette, 
+        errorbar=None, 
+        width=width
+    )
     
+    # Customize bar edges
     for bar in ax.patches:
         bar.set_edgecolor(edgecolor)
         bar.set_linewidth(linewidth)
     
+    # Add hatches
     if hatch and hatches_list:
         for i, bar_group in enumerate(ax.patches):
             hatch_pattern = hatches_list[i % len(hatches_list)]
             bar_group.set_hatch(hatch_pattern)
     
-    if data_labels:
-        num_categories = len(categories)
-        for i, p in enumerate(ax.patches):
-            if have_overfitting:
-                color_index = i // num_categories
-                if color_index < len(have_overfitting):
-                    if have_overfitting[color_index] < 0:
-                        color = 'red'
-                    elif have_overfitting[color_index] > 0:
-                        color = 'green'
-                    else:
-                        color = 'black'
-                else:
-                    color = 'black'
-            else:
-                color = 'black'
-            
-            ax.annotate(format(p.get_height(), f'.{annote_num}f'),
-                        (p.get_x() + p.get_width() / 2., p.get_height()),
-                        ha='center', va='center', 
-                        xytext=(0, 10), 
-                        textcoords='offset points',
-                        color=color)
+    # Add value labels with overfitting color coding
+    for i, p in enumerate(ax.patches):
+        ax.annotate(
+            format(p.get_height(), f'.{annote_num}f'),
+            (p.get_x() + p.get_width() / 2.1, p.get_height() - 0.012),
+            ha='center', va='center', 
+            xytext=(0, 10), 
+            textcoords='offset points',
+            fontweight='bold'
+        )
     
-    plt.title(title)
-    plt.xlabel(xlabel)
-    plt.ylabel(ylabel)
-    plt.legend(loc='center right')
+    # Customize X-axis text colors and size
+    x_labels = ax.get_xticklabels()
+    for idx, label in enumerate(x_labels):
+        color = 'black'  # Default color
+        if have_overfitting[idx] >= 1:
+            color = 'green'
+        elif have_overfitting[idx] <= -1:
+            color = 'red'
+        label.set_color(color)
+        label.set_fontsize(12)
+        label.set_fontweight('bold')
     
-    plt.grid(True, linestyle='--', linewidth=0.6, alpha=0.4)
+    # Customize plot
+    plt.title(title,fontsize=16, fontweight='bold')
+    plt.xlabel(xlabel, fontweight='bold', fontsize=16)
+    plt.ylabel(ylabel, fontweight='bold', fontsize=16)
+    plt.yticks(np.arange(0, 1.1, 0.1), fontweight='bold')
+    plt.legend(title='Metrics', title_fontsize=16, fontsize=14, bbox_to_anchor=(1, 1), loc='best')
+    plt.grid(True, linestyle='--', axis='y', linewidth=0.6, alpha=0.85)
+    plt.xticks(rotation=0)
+    plt.tight_layout()
     
     plt.show()
+
+
+def plots_evaluate_models_regression(
+    models_values, 
+    models_names=None, 
+    evaluate_names=None,
+    have_overfitting=None,
+    metrics_type='regression',
+    palette='magma',
+    title='Model Performance Across Different Metrics',
+    xlabel='',
+    ylabel='',
+    width=0.75,
+    edgecolor='black',
+    linewidth=1.5,
+    hatches=None,
+    hatch=False,
+    figsize=(18, 6),
+    annote_num=3
+):
+    """
+    Create an enhanced grouped bar plot of model performance metrics.
+    """
+    # Prepare data
+    num_models = len(models_values)
+    num_metrics = len(models_values[0])
+    
+    if models_names is None:
+        models_names = [f'Model {i+1}' for i in range(num_models)]
+    
+    if evaluate_names is None:
+        evaluate_names = [f'Metric {i+1}' for i in range(num_metrics)]
+    
+    # Ensure have_overfitting is the correct length
+    if have_overfitting is None:
+        have_overfitting = [0] * num_models
+    else:
+        have_overfitting = list(have_overfitting)[:num_models]
+        have_overfitting.extend([0] * (num_models - len(have_overfitting)))
+    
+    # Create DataFrame
+    df = pd.DataFrame(models_values, columns=evaluate_names)
+    df['Model'] = models_names
+    
+    if metrics_type == 'regression':
+        # Create normalized values for visualization
+        df_normalized = df.copy()
+        for col in evaluate_names:
+            metric_name = col.lower()
+            if 'r2' in metric_name or 'r²' in metric_name:
+                # For R², higher is better, normalize directly
+                df_normalized[col] = (df[col] - df[col].min()) / (df[col].max() - df[col].min())
+            else:
+                # For error metrics (MSE, RMSE, MAE), lower is better, normalize and invert
+                df_normalized[col] = 1 - (df[col] - df[col].min()) / (df[col].max() - df[col].min())
+    else:
+        df_normalized = df.copy()
+    
+    # Melt the DataFrames
+    df_melted = df.melt(id_vars='Model', var_name='Metric', value_name='Value')
+    df_normalized_melted = df_normalized.melt(id_vars='Model', var_name='Metric', value_name='Normalized_Value')
+    
+    # Set up the plot
+    plt.figure(figsize=figsize)
+    
+    # Prepare hatches
+    if hatch and not hatches:
+        hatches_list = random.sample(['X', 'oo', 'O|', '/', '+', '++', '--', '-\\', 'xx', '*-', '\\\\', '|*', '\\', 'OO', 'o', '**', 'o-', '*', '//', '||', '+o', '..', '/o', 'O.', '\\|', 'x*', '|', '-', None], len(evaluate_names))
+    else:
+        hatches_list = hatches
+    
+    # Create the plot using normalized values for the bar heights
+    ax = sns.barplot(
+        data=df_normalized_melted if metrics_type == 'regression' else df_melted, 
+        x='Model', 
+        y='Normalized_Value' if metrics_type == 'regression' else 'Value', 
+        hue='Metric', 
+        palette=palette, 
+        errorbar=None, 
+        width=width
+    )
+    
+    # Customize bar edges
+    for bar in ax.patches:
+        bar.set_edgecolor(edgecolor)
+        bar.set_linewidth(linewidth)
+    
+    # Add hatches
+    if hatch and hatches_list:
+        for i, bar_group in enumerate(ax.patches):
+            hatch_pattern = hatches_list[i % len(hatches_list)]
+            bar_group.set_hatch(hatch_pattern)
+    
+    # Add value labels
+    bars = ax.patches
+    num_bars = len(bars)
+    for idx, (bar, value) in enumerate(zip(bars, df_melted['Value'])):
+        ax.annotate(
+            format(value, f'.{annote_num}f'),
+            xy=(bar.get_x() + bar.get_width() / 2, bar.get_height()),
+            xytext=(0, 5),
+            textcoords='offset points',
+            ha='center',
+            va='bottom',
+            fontweight='bold'
+        )
+    
+    # Customize X-axis text colors and size
+    x_labels = ax.get_xticklabels()
+    for idx, label in enumerate(x_labels):
+        color = 'black'
+        if have_overfitting[idx] >= 1:
+            color = 'green'
+        elif have_overfitting[idx] <= -1:
+            color = 'red'
+        label.set_color(color)
+        label.set_fontsize(12)
+        label.set_fontweight('bold')
+    
+    # Customize plot
+    plt.title(title, fontsize=16, fontweight='bold')
+    plt.xlabel(xlabel, fontweight='bold', fontsize=16)
+    plt.ylabel(ylabel, fontweight='bold', fontsize=16)
+    
+    # Adjust y-axis based on metric type
+    if metrics_type == 'regression':
+        plt.yticks(np.arange(0, 1.1, 0.1), fontweight='bold')
+    else:
+        plt.yticks(fontweight='bold')
+    
+    plt.legend(title='Metrics', title_fontsize=16, fontsize=14, bbox_to_anchor=(1, 1), loc='best')
+    plt.grid(True, linestyle='--', axis='y', linewidth=0.6, alpha=0.85)
+    plt.xticks(rotation=0)
+    plt.tight_layout()
+    
+    plt.show()
+
+
+def plot_model_performance(
+    models_values, 
+    models_names, 
+    evaluate_names, 
+    have_overfitting,
+    metrics_type='classification',  # 'classification' or 'regression'
+    cmap='YlGnBu',
+    title='Model Performance Metrics',
+    xlabel='',
+    ylabel='',
+    figsize=(14, 7),
+    x_rotation=45
+):
+    """
+    Create a heatmap visualization of model performance metrics using seaborn.
+    
+    Parameters:
+    - models_values: 2D list of performance values 
+    - models_names: List of model names
+    - evaluate_names: List of metric names
+    - have_overfitting: List indicating overfitting status for each model
+    - metrics_type: 'classification' or 'regression' to handle different metric types
+    - Additional styling parameters for title, labels, and size.
+    """
+    # Convert to numpy array for easier manipulation
+    values = np.array(models_values)
+
+    # Ensure have_overfitting matches the number of models
+    num_models = len(models_names)
+    if len(have_overfitting) != num_models:
+        have_overfitting = have_overfitting[:num_models] + [0] * (num_models - len(have_overfitting))
+    
+    # Create the figure and axis
+    plt.figure(figsize=figsize)
+
+    if metrics_type == 'regression':
+        # Create separate normalized matrices for visualization
+        normalized_values = np.zeros_like(values, dtype=float)
+        
+        for j in range(values.shape[1]):
+            metric_name = evaluate_names[j].lower()
+            
+            if 'r2' in metric_name or 'r²' in metric_name:
+                # For R², higher is better, normalize directly
+                normalized_values[:, j] = (values[:, j] - np.min(values[:, j])) / \
+                                        (np.max(values[:, j]) - np.min(values[:, j]))
+            else:
+                # For MSE, RMSE, MAE, etc., lower is better, normalize and invert
+                normalized_values[:, j] = 1 - (values[:, j] - np.min(values[:, j])) / \
+                                        (np.max(values[:, j]) - np.min(values[:, j]))
+        
+        # Create heatmap using normalized values for colors but show original values
+        ax = sns.heatmap(normalized_values,
+                        annot=values,  # Show original values
+                        cmap=cmap,
+                        xticklabels=evaluate_names,
+                        yticklabels=models_names,
+                        fmt='.3f',
+                        cbar_kws={'label': 'Normalized Score'})
+    else:
+        # Classification metrics (original behavior)
+        ax = sns.heatmap(values, 
+                        annot=True, 
+                        cmap=cmap,
+                        xticklabels=evaluate_names,
+                        yticklabels=models_names,
+                        fmt='.3f',
+                        cbar_kws={'label': 'Performance Score'})
+
+    # Customize annotations
+    for text in ax.texts:
+        text.set_weight('bold')
+        text.set_fontsize(15)
+
+    # Color-code y-axis labels based on overfitting status
+    y_tick_labels = ax.get_yticklabels()
+    for idx, label in enumerate(y_tick_labels):
+        if have_overfitting[idx] == -1:
+            label.set_color('red')
+        elif have_overfitting[idx] == 1:
+            label.set_color('green')
+        else:
+            label.set_color('black')
+        label.set_fontweight('bold')
+        label.set_fontsize(14)
+    
+    # Customize plot
+    plt.title(title, fontweight='bold', fontsize=18)
+    plt.xlabel(xlabel, fontweight='bold', fontsize=16)
+    plt.ylabel(ylabel, fontweight='bold', fontsize=16)
+    
+    # Rotate axis labels
+    plt.xticks(rotation=x_rotation)
+    plt.yticks(rotation=0)
+    
+    # Make x-axis labels bold
+    ax.set_xticklabels(ax.get_xticklabels(), fontweight='bold', fontsize=14)
+
+    # Adjust layout
+    plt.tight_layout()
+
+    # Show the plot
+    plt.show()
+
+
